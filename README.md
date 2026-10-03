@@ -1,5 +1,7 @@
 # 🎬 CineMatch — Conversational Movie Recommender (LLM Agent + Collaborative Filtering)
 
+![Tests](https://github.com/ar875/movie-recommender-chatbot/actions/workflows/tests.yml/badge.svg)
+
 ### 🔗 [Try the live app](https://ar875-movie-recommender-chatbot-app-lxqtc8.streamlit.app)
 
 > Note: the first message after the app has been idle may take 30-60 seconds
