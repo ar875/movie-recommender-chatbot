@@ -92,6 +92,49 @@ class MovieRecommender:
             self._genre_lookup_cache = dict(zip(self.movies["movieId"], self.movies["genres"]))
         return self._genre_set(self._genre_lookup_cache.get(movie_id, ""))
 
+    # ---------- genre/year filtering ----------
+    #
+    # This is a HARD constraint ("must be this genre / from this era"),
+    # separate from the soft genre-overlap SCORE used for hybrid re-ranking
+    # above. A request like "suggest some thriller movies" needs a real
+    # filter — without one, the agent could only fall back to generic
+    # popularity and either present irrelevant results or awkwardly admit
+    # it has nothing to offer, both of which were observed in real testing.
+
+    @staticmethod
+    def _normalize_genre_token(g: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", g.lower())
+
+    def _genre_matches(self, movie_id, genre_query: str) -> bool:
+        query_norm = self._normalize_genre_token(genre_query)
+        return any(
+            query_norm in self._normalize_genre_token(g) or self._normalize_genre_token(g) in query_norm
+            for g in self._genres_for(movie_id)
+        )
+
+    def _year_for(self, movie_id):
+        if not hasattr(self, "_year_lookup_cache"):
+            def extract_year(title):
+                m = re.search(r"\((\d{4})\)\s*$", title)
+                return int(m.group(1)) if m else None
+            self._year_lookup_cache = {
+                mid: extract_year(title) for mid, title in zip(self.movies["movieId"], self.movies["title"])
+            }
+        return self._year_lookup_cache.get(movie_id)
+
+    def _passes_filters(self, movie_id, genre=None, min_year=None, max_year=None) -> bool:
+        if genre and not self._genre_matches(movie_id, genre):
+            return False
+        if min_year is not None or max_year is not None:
+            year = self._year_for(movie_id)
+            if year is None:
+                return False  # can't confirm it meets a year constraint, so exclude it
+            if min_year is not None and year < min_year:
+                return False
+            if max_year is not None and year > max_year:
+                return False
+        return True
+
     # ---------- title matching helpers ----------
 
     @staticmethod
@@ -151,20 +194,45 @@ class MovieRecommender:
 
     # ---------- tool functions (same interface the LLM agent calls) ----------
 
-    def tool_get_recommendations(self, user_id: int = None, seed_movie_title: str = None, top_k: int = 5):
+    def tool_get_recommendations(
+        self,
+        user_id: int = None,
+        seed_movie_title: str = None,
+        top_k: int = 5,
+        genre: str = None,
+        min_year: int = None,
+        max_year: int = None,
+    ):
         """
-        Get movie recommendations.
+        Get movie recommendations, optionally filtered by genre and/or release year range.
         - If user_id is known, use personalized ALS recommendations.
         - Else if a seed_movie_title is given, recommend similar movies (item-based via ALS item factors).
         - Else, fall back to popularity.
+
+        Filtering uses a retrieve-then-filter approach: fetch more raw
+        candidates than needed, then narrow by genre/year, since neither the
+        ALS model nor plain popularity ranking has any concept of genre or
+        year by itself.
         """
         if top_k is None:
             top_k = 5
 
+        has_filters = bool(genre or min_year is not None or max_year is not None)
+        id_to_title = dict(zip(self.movies["movieId"], self.movies["title"]))
+
+        def build_result(method, movie_ids, **extra):
+            result = {"method": method, "recommendations": [id_to_title[mid] for mid in movie_ids], **extra}
+            if has_filters:
+                result["filters_applied"] = {"genre": genre, "min_year": min_year, "max_year": max_year}
+                if not movie_ids:
+                    result["note"] = (result.get("note", "") + " No results matched those filters; try loosening genre/year.").strip()
+            return result
+
         if user_id is not None and user_id in self.user_to_idx:
-            recs = self.als_recommend(user_id, k=top_k)
-            titles = self.movies.loc[self.movies["movieId"].isin(recs), "title"].tolist()
-            return {"method": "personalized_als", "recommendations": titles}
+            fetch_k = max(top_k * 6, 30) if has_filters else top_k
+            recs = self.als_recommend(user_id, k=fetch_k)
+            filtered = [mid for mid in recs if self._passes_filters(mid, genre, min_year, max_year)][:top_k]
+            return build_result("personalized_als", filtered)
 
         if seed_movie_title:
             movie_id, matched_title = self.find_movie_id(seed_movie_title)
@@ -172,9 +240,12 @@ class MovieRecommender:
                 m_idx = self.movie_to_idx[movie_id]
 
                 # Over-fetch ALS candidates (more than top_k) so there's a
-                # real pool to re-rank by genre overlap, not just whatever
-                # ALS alone would have returned.
-                fetch_k = max(top_k * 4, 20)
+                # real pool to re-rank by genre overlap and/or hard-filter,
+                # not just whatever ALS alone would have returned. Fetch
+                # even more when a hard filter is active, since some
+                # candidates will get excluded entirely rather than just
+                # re-ranked.
+                fetch_k = max(top_k * 8, 40) if has_filters else max(top_k * 4, 20)
                 similar_ids, als_scores = self.model.similar_items(m_idx, N=fetch_k + 1)
                 als_scores = np.asarray(als_scores, dtype=float)
 
@@ -194,6 +265,8 @@ class MovieRecommender:
                     cand_movie_id = self.idx_to_movie[raw_idx]
                     if cand_movie_id == movie_id:
                         continue  # a movie isn't "similar to itself"
+                    if not self._passes_filters(cand_movie_id, genre, min_year, max_year):
+                        continue
                     genre_score = self._jaccard_similarity(seed_genres, self._genres_for(cand_movie_id))
                     blended = (
                         self.HYBRID_ALS_WEIGHT * als_score_norm
@@ -203,12 +276,7 @@ class MovieRecommender:
 
                 candidates.sort(key=lambda pair: pair[1], reverse=True)
                 similar_movie_ids = [mid for mid, _ in candidates[:top_k]]
-                # Preserve the ranked order in the output (titles list),
-                # rather than whatever order .isin() + the dataframe happen
-                # to return them in.
-                id_to_title = dict(zip(self.movies["movieId"], self.movies["title"]))
-                titles = [id_to_title[mid] for mid in similar_movie_ids]
-                return {"method": "item_similarity", "seed_matched_to": matched_title, "recommendations": titles}
+                return build_result("item_similarity", similar_movie_ids, seed_matched_to=matched_title)
             else:
                 return {
                     "method": "not_found",
@@ -216,9 +284,23 @@ class MovieRecommender:
                     "note": f"Couldn't match '{seed_movie_title}' to a movie in the catalog.",
                 }
 
-        top_ids = self.popularity_recommend(top_k=top_k)
-        titles = self.movies.loc[self.movies["movieId"].isin(top_ids), "title"].tolist()
-        return {"method": "popularity_fallback", "recommendations": titles}
+        if has_filters:
+            # Scan the FULL popularity ranking (already sorted, already in
+            # memory — free to iterate) with early exit, rather than only
+            # checking a small top slice. A niche genre (Documentary,
+            # Musical, Film-Noir) may have zero matches among the overall
+            # most-popular movies but plenty further down the list — an
+            # early top-slice-then-filter approach would incorrectly report
+            # "no results" for a genre the catalog actually has.
+            filtered = []
+            for mid in self.popularity_ranking:
+                if self._passes_filters(mid, genre, min_year, max_year):
+                    filtered.append(mid)
+                    if len(filtered) >= top_k:
+                        break
+        else:
+            filtered = self.popularity_recommend(top_k=top_k)
+        return build_result("popularity_fallback", filtered)
 
     def tool_lookup_movie_info(self, title_query: str):
         """Look up factual info (title, genres) for a movie by fuzzy title match."""
@@ -242,13 +324,16 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "tool_get_recommendations",
-            "description": "Get movie recommendations, either personalized for a known user_id, similar to a seed movie the user mentions, or popular movies as a fallback.",
+            "description": "Get movie recommendations, either personalized for a known user_id, similar to a seed movie the user mentions, or popular movies as a fallback. Supports optional filtering by genre and/or release year range.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "user_id": {"type": ["integer", "null"], "description": "Numeric user ID, only if the user explicitly gave one."},
                     "seed_movie_title": {"type": ["string", "null"], "description": "A movie title the user wants similar recommendations to."},
                     "top_k": {"type": ["integer", "null"], "description": "How many recommendations to return. Defaults to 5 if not specified.", "default": 5},
+                    "genre": {"type": ["string", "null"], "description": "Filter results to this genre (e.g. 'Comedy', 'Thriller', 'Sci-Fi'), only if the user specifically asked for a genre."},
+                    "min_year": {"type": ["integer", "null"], "description": "Only include movies released in or after this year, if the user asked for something recent/newer/from a certain era."},
+                    "max_year": {"type": ["integer", "null"], "description": "Only include movies released in or before this year, if the user asked for something older/classic."},
                 },
             },
         },
@@ -275,9 +360,14 @@ SYSTEM_PROMPT = (
     "or asks a factual question about a movie — never answer from your own knowledge, even for vague "
     "requests like 'I'm bored' or 'surprise me' (call tool_get_recommendations with no arguments in that case) "
     "or factual questions like 'what genre is X' or 'tell me about X' (call tool_lookup_movie_info). "
+    "If the user asks for a specific genre (e.g. 'a thriller', 'something funny', 'sci-fi movies') or a time "
+    "period (e.g. 'something recent', 'an old classic', 'from the 90s'), pass the genre/min_year/max_year "
+    "parameters to tool_get_recommendations rather than guessing from an unfiltered list. "
     "Only skip calling a tool if the user's message is clearly unrelated to movies. "
     "Only state facts (like runtime, year, genre, plot details) that were explicitly returned by a tool call. "
     "If the user asks for something a tool doesn't provide, say you don't have that information rather than guessing. "
+    "If a tool result includes a 'note' saying no results matched the filters, tell the user honestly and "
+    "suggest loosening their request — never present unrelated results as if they matched. "
     "NEVER recommend a movie title that did not come from a tool call in this conversation. "
     "Keep responses concise and conversational."
 )

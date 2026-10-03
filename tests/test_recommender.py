@@ -243,6 +243,116 @@ def test_tool_get_recommendations_unknown_user_falls_back_to_popularity(recommen
 
 
 # ---------------------------------------------------------------------------
+# Genre / year filtering
+#
+# These are regression tests for a real gap found during manual testing:
+# asking for "some thriller movies" or "some comedy movies" previously had
+# no way to actually filter, so the agent either silently returned unrelated
+# popular movies or awkwardly admitted it had nothing — inconsistently.
+# ---------------------------------------------------------------------------
+
+def test_tool_get_recommendations_popularity_fallback_with_genre_filter(recommender):
+    # Catalog's only Comedy-tagged movie is Toy Story (Animation|Comedy).
+    result = recommender.tool_get_recommendations(genre="Comedy", top_k=5)
+    assert result["recommendations"] == ["Toy Story (1995)"]
+    assert result["filters_applied"]["genre"] == "Comedy"
+
+
+def test_tool_get_recommendations_genre_filter_is_case_and_hyphen_insensitive(recommender):
+    # "sci fi" (no hyphen, lowercase) should still match "Sci-Fi" in the catalog.
+    result = recommender.tool_get_recommendations(genre="sci fi", top_k=5)
+    assert "Inception (2010)" in result["recommendations"]
+    assert "Interstellar (2014)" in result["recommendations"]
+
+
+def test_tool_get_recommendations_genre_filter_no_match_returns_honest_note(recommender):
+    """Regression test for the real inconsistency found in manual testing:
+    the agent must be able to honestly report 'no matches' via a `note`
+    field, rather than silently falling back to irrelevant popular titles.
+    """
+    result = recommender.tool_get_recommendations(genre="Horror", top_k=5)
+    assert result["recommendations"] == []
+    assert "note" in result
+    assert "no results matched" in result["note"].lower()
+
+
+def test_tool_get_recommendations_year_filter(recommender):
+    # min_year=2000 should exclude Forrest Gump (1994) and Toy Story (1995).
+    result = recommender.tool_get_recommendations(min_year=2000, top_k=5)
+    assert "Forrest Gump (1994)" not in result["recommendations"]
+    assert "Toy Story (1995)" not in result["recommendations"]
+    assert "Interstellar (2014)" in result["recommendations"]
+
+
+def test_tool_get_recommendations_year_range_filter(recommender):
+    result = recommender.tool_get_recommendations(min_year=2008, max_year=2012, top_k=5)
+    titles = result["recommendations"]
+    assert "Dark Knight, The (2008)" in titles
+    assert "Dark Knight Rises, The (2012)" in titles
+    assert "Interstellar (2014)" not in titles  # outside the range
+    assert "Forrest Gump (1994)" not in titles  # outside the range
+
+
+def test_tool_get_recommendations_item_similarity_respects_genre_filter(recommender):
+    """Even the hybrid item-similarity path should honor a hard genre
+    filter, not just use genre as a soft re-ranking signal."""
+    dark_knight_idx = recommender.movie_to_idx[2]
+    forrest_gump_idx = recommender.movie_to_idx[6]
+    interstellar_idx = recommender.movie_to_idx[7]
+
+    recommender.model.similar_items.return_value = (
+        [dark_knight_idx, forrest_gump_idx, interstellar_idx],
+        [0.90, 0.80, 0.60],
+    )
+
+    # Seeded on Inception, but explicitly asking for Drama — Dark Knight
+    # (Action|Crime) should be excluded even though it has the highest raw
+    # ALS score, since it isn't tagged Drama.
+    result = recommender.tool_get_recommendations(
+        seed_movie_title="Inception", genre="Drama", top_k=5
+    )
+    assert "Dark Knight, The (2008)" not in result["recommendations"]
+    assert "Interstellar (2014)" in result["recommendations"]  # Adventure|Drama|Sci-Fi
+
+
+def test_tool_get_recommendations_popularity_fallback_finds_niche_genre_regression(recommender):
+    """Regression test for a real bug found in manual testing: filtering
+    only the TOP of the popularity ranking (rather than scanning the full
+    list) incorrectly reported 'no results' for niche genres (Documentary,
+    Musical, Film-Noir) that exist in the real catalog but never rank among
+    the overall most-popular movies.
+
+    In this fixture, Forrest Gump is tagged with 'War' and is NOT among the
+    top 2 most popular overall (Dark Knight and Toy Story rank higher), but
+    a request for War movies should still find it by scanning further down
+    the popularity list rather than giving up after the first couple of
+    most-popular titles.
+    """
+    rec = recommender
+    # Add a War-tagged movie that's deliberately low in the popularity
+    # ranking, to prove the scan reaches it.
+    rec.movies = pd.concat([rec.movies, pd.DataFrame([
+        {"movieId": 8, "title": "Saving Private Ryan (1998)", "genres": "Action|Drama|War"}
+    ])], ignore_index=True)
+    rec.movie_rating_counts[8] = 1  # deliberately the LEAST popular movie in the fixture
+    rec.popularity_ranking = rec.movie_rating_counts.sort_values(ascending=False).index.tolist()
+
+    result = rec.tool_get_recommendations(genre="War", top_k=5)
+
+    assert "Saving Private Ryan (1998)" in result["recommendations"]
+    assert "note" not in result  # a real match was found, no need to apologize
+
+
+def test_tool_get_recommendations_no_filters_does_not_add_filter_keys(recommender):
+    """When no filters are passed, the result shouldn't carry filter-related
+    keys at all — keeps the common case's output unchanged for anything
+    (like the LLM prompt or other tests) relying on the original shape."""
+    result = recommender.tool_get_recommendations(top_k=3)
+    assert "filters_applied" not in result
+    assert "note" not in result
+
+
+# ---------------------------------------------------------------------------
 # run_agent — the tool-calling orchestration
 # ---------------------------------------------------------------------------
 
