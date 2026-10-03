@@ -18,13 +18,23 @@ import difflib
 
 import numpy as np
 import pandas as pd
+from huggingface_hub import hf_hub_download
 
 
 class MovieRecommender:
     """Loads the trained ALS model + catalog once, and exposes the same
-    tool functions used by the LLM agent in the notebook."""
+    tool functions used by the LLM agent in the notebook.
 
-    def __init__(self, movies_csv_path: str, model_pkl_path: str):
+    Model/catalog files are large (the ALS model's pickle can be 300MB+,
+    well over GitHub's 100MB file limit), so they're hosted on Hugging Face
+    Hub instead of committed to the repo. hf_hub_download fetches and caches
+    them locally on first use — subsequent calls reuse the cached copy."""
+
+    def __init__(self, hf_repo_id: str, movies_csv_filename: str = "movies_clean.csv",
+                 model_pkl_filename: str = "als_model.pkl"):
+        movies_csv_path = hf_hub_download(repo_id=hf_repo_id, filename=movies_csv_filename)
+        model_pkl_path = hf_hub_download(repo_id=hf_repo_id, filename=model_pkl_filename)
+
         self.movies = pd.read_csv(movies_csv_path)
 
         with open(model_pkl_path, "rb") as f:
@@ -51,6 +61,36 @@ class MovieRecommender:
         self.movie_titles_clean = [
             self._normalize_article(self._strip_year(t)) for t in self.movie_titles
         ]
+
+    # ---------- hybrid recommendation: blend ALS similarity with genre overlap ----------
+    #
+    # Pure ALS similarity is behavior-based only ("people who liked A also
+    # liked B"), which sometimes surfaces thematically unrelated movies that
+    # happen to share an audience (e.g. a prestige drama next to an action
+    # movie). Blending in genre overlap doesn't replace ALS — it re-ranks a
+    # larger pool of ALS candidates so thematically consistent picks are
+    # preferred when the raw ALS scores are close.
+
+    HYBRID_ALS_WEIGHT = 0.5  # 0.5 = equal weight to behavior (ALS) and content (genre)
+
+    @staticmethod
+    def _genre_set(genres_str) -> set:
+        return set(genres_str.split("|")) if genres_str else set()
+
+    @staticmethod
+    def _jaccard_similarity(set_a: set, set_b: set) -> float:
+        if not set_a or not set_b:
+            return 0.0
+        union = len(set_a | set_b)
+        return len(set_a & set_b) / union if union else 0.0
+
+    def _genres_for(self, movie_id) -> set:
+        # Lazily build and cache a movieId -> genre-set lookup on first use,
+        # so repeated calls (one per candidate being re-ranked) are O(1)
+        # instead of scanning the movies dataframe each time.
+        if not hasattr(self, "_genre_lookup_cache"):
+            self._genre_lookup_cache = dict(zip(self.movies["movieId"], self.movies["genres"]))
+        return self._genre_set(self._genre_lookup_cache.get(movie_id, ""))
 
     # ---------- title matching helpers ----------
 
@@ -130,11 +170,44 @@ class MovieRecommender:
             movie_id, matched_title = self.find_movie_id(seed_movie_title)
             if movie_id is not None and movie_id in self.movie_to_idx:
                 m_idx = self.movie_to_idx[movie_id]
-                similar_ids, scores = self.model.similar_items(m_idx, N=top_k + 1)
-                similar_movie_ids = [
-                    self.idx_to_movie[i] for i in similar_ids if self.idx_to_movie[i] != movie_id
-                ][:top_k]
-                titles = self.movies.loc[self.movies["movieId"].isin(similar_movie_ids), "title"].tolist()
+
+                # Over-fetch ALS candidates (more than top_k) so there's a
+                # real pool to re-rank by genre overlap, not just whatever
+                # ALS alone would have returned.
+                fetch_k = max(top_k * 4, 20)
+                similar_ids, als_scores = self.model.similar_items(m_idx, N=fetch_k + 1)
+                als_scores = np.asarray(als_scores, dtype=float)
+
+                seed_genres = self._genres_for(movie_id)
+
+                # Normalize ALS scores to 0-1 within this candidate set so
+                # they're on a comparable scale to the Jaccard genre score
+                # before blending (ALS raw scores aren't bounded to 0-1).
+                score_range = als_scores.max() - als_scores.min()
+                if score_range > 0:
+                    als_scores_norm = (als_scores - als_scores.min()) / score_range
+                else:
+                    als_scores_norm = np.ones_like(als_scores)
+
+                candidates = []
+                for raw_idx, als_score_norm in zip(similar_ids, als_scores_norm):
+                    cand_movie_id = self.idx_to_movie[raw_idx]
+                    if cand_movie_id == movie_id:
+                        continue  # a movie isn't "similar to itself"
+                    genre_score = self._jaccard_similarity(seed_genres, self._genres_for(cand_movie_id))
+                    blended = (
+                        self.HYBRID_ALS_WEIGHT * als_score_norm
+                        + (1 - self.HYBRID_ALS_WEIGHT) * genre_score
+                    )
+                    candidates.append((cand_movie_id, blended))
+
+                candidates.sort(key=lambda pair: pair[1], reverse=True)
+                similar_movie_ids = [mid for mid, _ in candidates[:top_k]]
+                # Preserve the ranked order in the output (titles list),
+                # rather than whatever order .isin() + the dataframe happen
+                # to return them in.
+                id_to_title = dict(zip(self.movies["movieId"], self.movies["title"]))
+                titles = [id_to_title[mid] for mid in similar_movie_ids]
                 return {"method": "item_similarity", "seed_matched_to": matched_title, "recommendations": titles}
             else:
                 return {

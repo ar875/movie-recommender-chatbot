@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 data/als_model.pkl
 .DS_Store
+.hf_cache/

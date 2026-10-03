@@ -1,28 +1,15 @@
-import os
 import random
-import requests
 import streamlit as st
 from openai import OpenAI
 
 from recommender import MovieRecommender, run_agent, SYSTEM_PROMPT
 
 # The trained ALS model file is too large for a normal GitHub push (~300MB,
-# over GitHub's 100MB hard limit), so it's hosted separately on Hugging Face
-# Hub and downloaded once here, the first time the app starts.
-MODEL_URL = "https://huggingface.co/arpit110/cinematch-als-model/resolve/main/als_model.pkl"
-MODEL_PATH = "data/als_model.pkl"
-
-
-def ensure_model_downloaded():
-    if os.path.exists(MODEL_PATH):
-        return
-    os.makedirs("data", exist_ok=True)
-    with st.spinner("Downloading recommendation model (first run only, ~300MB)..."):
-        response = requests.get(MODEL_URL, stream=True)
-        response.raise_for_status()
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+# over GitHub's 100MB hard limit), so it's hosted on Hugging Face Hub
+# instead. MovieRecommender downloads and caches both files internally via
+# hf_hub_download the first time it's constructed — no manual download
+# logic needed here.
+HF_REPO_ID = "arpit110/cinematch-als-model"
 
 st.set_page_config(
     page_title="CineMatch — AI Movie Recommender",
@@ -92,11 +79,7 @@ LOADING_MESSAGES = [
 
 @st.cache_resource
 def load_recommender():
-    ensure_model_downloaded()
-    return MovieRecommender(
-        movies_csv_path="data/movies_clean.csv",
-        model_pkl_path=MODEL_PATH,
-    )
+    return MovieRecommender(hf_repo_id=HF_REPO_ID)
 
 
 @st.cache_resource

@@ -189,6 +189,14 @@ type exact movie titles — someone might type "inception" instead of the
 catalog's exact "Inception (2010)". This turned out to be trickier than
 expected (see the Challenges section below).
 
+**Hybrid recommendation (ALS + genre):** the "similar movies" path
+over-fetches a larger pool of ALS candidates, then re-ranks them by blending
+in Jaccard genre similarity with the seed movie (normalized ALS score and
+genre overlap combined 50/50). This directly addresses a real limitation I
+found during testing — pure collaborative filtering occasionally recommended
+movies with no thematic connection to the seed, just because similar
+audiences happened to rate both highly.
+
 ### Phase 4 — Testing it properly
 
 This is the part most portfolio projects skip, and it's the part that
@@ -295,11 +303,12 @@ Being upfront about what doesn't work well is just as important as showing
 what does — it shows I actually understand the system, not just that I got
 lucky with good results.
 
-- **Recommendations are based on behavior, not content.** My model
-  recommends based on "people who liked A also liked B" — it has no idea
-  what a movie is actually *about*. This occasionally leads to odd pairings
-  (like recommending a serious historical drama alongside a superhero movie,
-  just because similar people happened to rate both highly).
+- **Genre blending helps, but isn't a full content-based model.** The
+  item-similarity path now re-ranks a pool of ALS candidates by blending in
+  Jaccard genre overlap with the seed movie (50/50 weight), which measurably
+  reduces thematically odd pairings. It's still a shallow signal, though —
+  genre tags don't capture plot, tone, or actual thematic similarity the way
+  a proper content embedding (e.g. from a synopsis) would.
 - **The AI can't apply filters it wasn't specifically built for.** If you say
   "something shorter" or "something newer," it can only choose from movies
   already mentioned earlier in the conversation — it has no actual way to
@@ -325,9 +334,12 @@ lucky with good results.
 
 ## What I'd do next with more time
 
-- Add a genre/content-based similarity blend, so recommendations aren't
-  purely behavior-based — this would likely fix the "odd pairing" issue
-  above.
+- Move beyond genre tags to a real content embedding (e.g. from plot
+  synopses or tags.csv's free-text tags) for the content half of the hybrid
+  blend — genre alone is a coarse signal.
+- Tune the ALS/genre blend weight properly (currently a fixed 0.5/0.5 split)
+  using an actual offline evaluation, rather than a reasonable-sounding
+  default.
 - Add real filters (runtime, release year, specific genre) as proper tool
   parameters, so requests like "something shorter" actually work instead of
   just re-picking from already-shown options.

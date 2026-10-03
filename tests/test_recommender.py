@@ -46,6 +46,7 @@ def recommender():
         {"movieId": 4, "title": "The Dark Knight (2011)", "genres": "Drama"},  # obscure duplicate/mislabeled entry
         {"movieId": 5, "title": "Toy Story (1995)", "genres": "Animation|Comedy"},
         {"movieId": 6, "title": "Forrest Gump (1994)", "genres": "Drama|Romance"},
+        {"movieId": 7, "title": "Interstellar (2014)", "genres": "Adventure|Drama|Sci-Fi"},
     ])
     rec.movie_titles = rec.movies["title"].tolist()
     rec.movie_titles_clean = [
@@ -56,12 +57,12 @@ def recommender():
     # movieId 4 (the obscure duplicate) — this is what the popularity
     # tie-break relies on to pick the right one.
     rec.movie_rating_counts = pd.Series(
-        {1: 50000, 2: 80000, 3: 60000, 4: 10, 5: 70000, 6: 65000}
+        {1: 50000, 2: 80000, 3: 60000, 4: 10, 5: 70000, 6: 65000, 7: 55000}
     )
     rec.popularity_ranking = rec.movie_rating_counts.sort_values(ascending=False).index.tolist()
 
     rec.user_to_idx = {1: 0, 2: 1}
-    rec.movie_to_idx = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+    rec.movie_to_idx = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
     rec.idx_to_movie = {v: k for k, v in rec.movie_to_idx.items()}
 
     rec.model = MagicMock()
@@ -172,6 +173,45 @@ def test_tool_get_recommendations_item_similarity(recommender):
     assert result["seed_matched_to"] == "Inception (2010)"
     assert "Inception (2010)" not in result["recommendations"]  # must not recommend itself
     assert len(result["recommendations"]) == 2
+
+
+def test_tool_get_recommendations_hybrid_reranks_by_genre_overlap(recommender):
+    """This is the core test for the hybrid (ALS + genre) recommender.
+
+    Pure ALS similarity ranks candidates purely by raw score: here that
+    would put Forrest Gump (no genre overlap with Inception) ahead of
+    Interstellar (shares Sci-Fi with Inception), since 0.70 > 0.65.
+
+    The hybrid blend should flip this for the final top-2: Interstellar's
+    genre overlap should be enough to outrank Forrest Gump's higher but
+    thematically unrelated raw ALS score. Dark Knight (highest raw score,
+    and some genre overlap via Action) should still be #1 either way.
+    """
+    dark_knight_idx = recommender.movie_to_idx[2]
+    forrest_gump_idx = recommender.movie_to_idx[6]
+    interstellar_idx = recommender.movie_to_idx[7]
+    toy_story_idx = recommender.movie_to_idx[5]
+
+    # Raw ALS order (by score alone) would be: Dark Knight, Forrest Gump,
+    # Interstellar, Toy Story.
+    recommender.model.similar_items.return_value = (
+        [dark_knight_idx, forrest_gump_idx, interstellar_idx, toy_story_idx],
+        [0.90, 0.70, 0.65, 0.50],
+    )
+
+    result = recommender.tool_get_recommendations(seed_movie_title="Inception", top_k=2)
+
+    assert result["method"] == "item_similarity"
+    # Interstellar (genre overlap) must outrank Forrest Gump (no overlap)
+    # in the final top-2, even though Forrest Gump had the higher raw score.
+    assert result["recommendations"] == ["Dark Knight, The (2008)", "Interstellar (2014)"]
+    assert "Forrest Gump (1994)" not in result["recommendations"]
+
+    # Also confirms the over-fetch pattern: the implementation should ask
+    # the model for more than top_k candidates (fetch_k=20 for top_k=2)
+    # so there's an actual pool to re-rank, not just top_k raw picks.
+    _, call_kwargs = recommender.model.similar_items.call_args
+    assert call_kwargs["N"] == 21  # fetch_k (20) + 1
 
 
 def test_tool_get_recommendations_seed_not_in_catalog(recommender):
