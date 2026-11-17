@@ -2,7 +2,7 @@
 
 ![Tests](https://github.com/ar875/movie-recommender-chatbot/actions/workflows/tests.yml/badge.svg)
 
-### 🔗 [Try the live app](https://ar875-movie-recommender-chatbot-app-lxqtc8.streamlit.app)
+### 🔗 [Try the live app](https://movie-recommender-chatbot-app.streamlit.app/)
 
 > Note: the first message after the app has been idle may take 30-60 seconds
 > while it downloads the trained model in the background — this is a one-time
@@ -297,60 +297,7 @@ the AI had actually given a 100% correct, real answer. The bug was in my
 
 ---
 
-## Limitations — what this project doesn't do (yet)
 
-Being upfront about what doesn't work well is just as important as showing
-what does — it shows I actually understand the system, not just that I got
-lucky with good results.
-
-- **Genre blending helps, but isn't a full content-based model.** The
-  item-similarity path now re-ranks a pool of ALS candidates by blending in
-  Jaccard genre overlap with the seed movie (50/50 weight), which measurably
-  reduces thematically odd pairings. It's still a shallow signal, though —
-  genre tags don't capture plot, tone, or actual thematic similarity the way
-  a proper content embedding (e.g. from a synopsis) would.
-- **The AI can't apply filters it wasn't specifically built for.** If you say
-  "something shorter" or "something newer," it can only choose from movies
-  already mentioned earlier in the conversation — it has no actual way to
-  filter by runtime or release year, because I never gave it that ability.
-- **My hallucination checker isn't perfect.** It only checks movie titles for
-  accuracy, not other facts like genres — so a small number of totally
-  correct answers get incorrectly flagged as "unverified" by my testing
-  script, even though they're actually fine.
-- **New users with zero history only get generic popular recommendations** —
-  there's no smarter cold-start handling (like asking a few quick preference
-  questions first).
-- **Free AI hosting services can change at any time.** Since I used a free
-  tier (Groq), the exact model I used could be removed or renamed in the
-  future, the same way an earlier model I tried already was mid-project.
-- **The live demo has a slow cold start.** Since the trained model file is
-  too large for GitHub and is hosted separately on Hugging Face, the app
-  downloads it fresh the first time it wakes up (after being idle), adding
-  30-60 seconds before the first reply. A production system would keep the
-  model warm in memory or use a proper model-serving setup instead of a
-  download-on-startup pattern.
-
----
-
-## What I'd do next with more time
-
-- Move beyond genre tags to a real content embedding (e.g. from plot
-  synopses or tags.csv's free-text tags) for the content half of the hybrid
-  blend — genre alone is a coarse signal.
-- Tune the ALS/genre blend weight properly (currently a fixed 0.5/0.5 split)
-  using an actual offline evaluation, rather than a reasonable-sounding
-  default.
-- Add real filters (runtime, release year, specific genre) as proper tool
-  parameters, so requests like "something shorter" actually work instead of
-  just re-picking from already-shown options.
-- Expand the hallucination checker to validate every type of fact the AI
-  might state (genres, years, etc.), not just movie titles.
-- Add a lightweight "cold-start" flow — a couple of quick questions for brand
-  new users before falling back to generic popular picks.
-- Move from a free-tier AI model to a paid, more capable one (like GPT-4o
-  mini) for a final quality pass, now that the core logic is proven to work.
-
----
 
 ## Tech stack
 
